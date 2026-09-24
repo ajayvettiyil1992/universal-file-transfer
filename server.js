@@ -12,9 +12,21 @@ const BLOB_PREFIX = 'uploads/';
 // Blob pathnames look like "uploads/<timestamp>/<file name>".
 const BLOB_ID_RE = /^\d+\/[^/\\\x00-\x1f]+$/;
 
+// Vercel names the variable <PREFIX>_READ_WRITE_TOKEN, where the prefix is
+// chosen when the store is connected ("BLOB" by default), so also accept any
+// such variable holding a Blob token.
+function findBlobToken() {
+  if (process.env.BLOB_READ_WRITE_TOKEN) return process.env.BLOB_READ_WRITE_TOKEN;
+  const key = Object.keys(process.env).find(
+    (k) => k.endsWith('_READ_WRITE_TOKEN') && String(process.env[k]).startsWith('vercel_blob_rw_')
+  );
+  return key && process.env[key];
+}
+const BLOB_TOKEN = findBlobToken();
+
 // "blob": Vercel Blob storage (needed on Vercel, whose filesystem is not persistent).
 // "disk": local folder, for running on your own machine or a VPS.
-const MODE = process.env.BLOB_READ_WRITE_TOKEN ? 'blob' : process.env.VERCEL ? 'unconfigured' : 'disk';
+const MODE = BLOB_TOKEN ? 'blob' : process.env.VERCEL ? 'unconfigured' : 'disk';
 
 if (MODE === 'disk') fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
@@ -61,8 +73,12 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 app.use('/api', (req, res, next) => {
   if (MODE !== 'unconfigured') return next();
+  // Names only, never values, to help spot a misnamed or missing variable.
+  const blobVars = Object.keys(process.env).filter((k) => /BLOB|READ_WRITE_TOKEN/i.test(k));
   res.status(503).json({
     error: 'Storage is not configured. Connect a Vercel Blob store to this project and redeploy.',
+    blobEnvVarsFound: blobVars,
+    vercelEnv: process.env.VERCEL_ENV,
   });
 });
 
@@ -73,7 +89,7 @@ app.get('/api/files', async (req, res, next) => {
       files = [];
       let cursor;
       do {
-        const page = await list({ prefix: BLOB_PREFIX, cursor });
+        const page = await list({ prefix: BLOB_PREFIX, cursor, token: BLOB_TOKEN });
         for (const b of page.blobs) {
           const id = b.pathname.slice(BLOB_PREFIX.length);
           files.push({
@@ -128,6 +144,7 @@ app.post('/api/blob-upload', express.json(), async (req, res) => {
   if (MODE !== 'blob') return res.status(400).json({ error: 'Blob storage is not enabled' });
   try {
     const result = await handleUpload({
+      token: BLOB_TOKEN,
       request: req,
       body: req.body,
       onBeforeGenerateToken: async (pathname) => {
@@ -155,7 +172,7 @@ app.delete('/api/files/:id', async (req, res, next) => {
   try {
     if (MODE === 'blob') {
       if (!BLOB_ID_RE.test(id)) return res.status(404).json({ error: 'File not found' });
-      await del(BLOB_PREFIX + id);
+      await del(BLOB_PREFIX + id, { token: BLOB_TOKEN });
     } else {
       const filePath = resolveStoredFile(id);
       if (!filePath) return res.status(404).json({ error: 'File not found' });
