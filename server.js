@@ -44,7 +44,9 @@ function resolveStoredFile(name) {
 }
 
 const storage = multer.diskStorage({
-  destination: UPLOAD_DIR,
+  // A function, not a string: with a string multer creates the folder at
+  // startup, which crashes on Vercel's read-only filesystem.
+  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
   filename: (req, file, cb) => {
     // Browsers send UTF-8 names but busboy decodes them as latin1.
     const original = Buffer.from(file.originalname, 'latin1').toString('utf8');
