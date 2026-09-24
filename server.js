@@ -2,15 +2,21 @@ const express = require('express');
 const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
-const { list, del, issueSignedToken, BlobError } = require('@vercel/blob');
-const { handleUpload, handleUploadPresigned } = require('@vercel/blob/client');
+const { Readable } = require('stream');
+const { list, put, get, del, BlobError } = require('@vercel/blob');
 
 const PORT = process.env.PORT || 3000;
 const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || path.join(__dirname, 'uploads'));
 const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB
+
+// Blob mode stores each file as 4 MB parts, sent and fetched through this
+// server: Vercel functions accept and return at most 4.5 MB per request, and
+// browsers could not reach the Blob API directly (ERR_ALPN_NEGOTIATION_FAILED).
+// Part pathnames: "uploads/<timestamp>/<size>/<file name>/<part index>".
+const CHUNK_SIZE = 4 * 1024 * 1024;
 const BLOB_PREFIX = 'uploads/';
-// Blob pathnames look like "uploads/<timestamp>/<file name>".
-const BLOB_ID_RE = /^\d+\/[^/\\\x00-\x1f]+$/;
+const FILE_ID_RE = /^\d+\/(\d+)\/[^/\\#?\x00-\x1f]+$/;
+const PART_RE = /^(\d+\/(\d+)\/([^/\\#?\x00-\x1f]+))\/(\d+)$/;
 
 // Vercel names the variable <PREFIX>_READ_WRITE_TOKEN, where the prefix is
 // chosen when the store is connected ("BLOB" by default), so also accept any
@@ -22,17 +28,14 @@ function findBlobToken() {
   );
   return key && process.env[key];
 }
+// Undefined when the store uses BLOB_STORE_ID + Vercel OIDC instead; the SDK
+// then authenticates with the function's OIDC token.
 const BLOB_TOKEN = findBlobToken();
-
-// Newer Blob stores give the project BLOB_STORE_ID instead of a read-write
-// token and authenticate with the function's Vercel OIDC token.
-// "token": read-write token; browser uploads use client tokens.
-// "oidc": OIDC; browser uploads use presigned URLs.
-const BLOB_AUTH = BLOB_TOKEN ? 'token' : process.env.BLOB_STORE_ID ? 'oidc' : null;
+const HAS_BLOB = Boolean(BLOB_TOKEN || process.env.BLOB_STORE_ID);
 
 // "blob": Vercel Blob storage (needed on Vercel, whose filesystem is not persistent).
 // "disk": local folder, for running on your own machine or a VPS.
-const MODE = BLOB_AUTH ? 'blob' : process.env.VERCEL ? 'unconfigured' : 'disk';
+const MODE = HAS_BLOB ? 'blob' : process.env.VERCEL ? 'unconfigured' : 'disk';
 
 if (MODE === 'disk') fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
@@ -59,6 +62,27 @@ function resolveStoredFile(name) {
   if (path.dirname(filePath) !== UPLOAD_DIR) return null;
   if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) return null;
   return filePath;
+}
+
+const partCount = (size) => Math.max(1, Math.ceil(size / CHUNK_SIZE));
+
+// Validate a blob file id ("<timestamp>/<size>/<name>") and return its size, or null.
+function parseFileId(id) {
+  const m = typeof id === 'string' && FILE_ID_RE.exec(id);
+  if (!m) return null;
+  const size = Number(m[1]);
+  return size <= MAX_FILE_SIZE ? size : null;
+}
+
+async function listBlobs(prefix) {
+  const blobs = [];
+  let cursor;
+  do {
+    const page = await list({ prefix, cursor, token: BLOB_TOKEN });
+    blobs.push(...page.blobs);
+    cursor = page.hasMore ? page.cursor : undefined;
+  } while (cursor);
+  return blobs;
 }
 
 const storage = multer.diskStorage({
@@ -92,22 +116,22 @@ app.get('/api/files', async (req, res, next) => {
   try {
     let files;
     if (MODE === 'blob') {
-      files = [];
-      let cursor;
-      do {
-        const page = await list({ prefix: BLOB_PREFIX, cursor, token: BLOB_TOKEN });
-        for (const b of page.blobs) {
-          const id = b.pathname.slice(BLOB_PREFIX.length);
-          files.push({
-            id,
-            name: path.posix.basename(id),
-            size: b.size,
-            uploadedAt: b.uploadedAt,
-            downloadUrl: b.downloadUrl,
-          });
-        }
-        cursor = page.hasMore ? page.cursor : undefined;
-      } while (cursor);
+      const byId = new Map();
+      for (const b of await listBlobs(BLOB_PREFIX)) {
+        const m = PART_RE.exec(b.pathname.slice(BLOB_PREFIX.length));
+        if (!m) continue;
+        const [, id, size, name] = m;
+        const f = byId.get(id) || { id, name, size: Number(size), uploadedAt: b.uploadedAt, stored: 0, parts: 0 };
+        f.stored += b.size;
+        f.parts += 1;
+        if (new Date(b.uploadedAt) > new Date(f.uploadedAt)) f.uploadedAt = b.uploadedAt;
+        byId.set(id, f);
+      }
+      files = [...byId.values()].map(({ stored, parts, ...f }) => ({
+        ...f,
+        parts: partCount(f.size),
+        complete: stored === f.size && parts === partCount(f.size),
+      }));
     } else {
       files = fs
         .readdirSync(UPLOAD_DIR, { withFileTypes: true })
@@ -119,25 +143,21 @@ app.get('/api/files', async (req, res, next) => {
             name: d.name,
             size: stat.size,
             uploadedAt: stat.mtime,
+            complete: true,
             downloadUrl: `/api/files/${encodeURIComponent(d.name)}`,
           };
         });
     }
     files.sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt));
-    res.json({
-      mode: MODE,
-      blobUpload: BLOB_AUTH === 'oidc' ? 'presigned' : 'client-token',
-      files,
-      maxFileSize: MAX_FILE_SIZE,
-    });
+    res.json({ mode: MODE, chunkSize: CHUNK_SIZE, files, maxFileSize: MAX_FILE_SIZE });
   } catch (err) {
     next(err);
   }
 });
 
-// Disk mode: the file goes through this server.
+// Disk mode: the whole file goes through this server in one request.
 app.post('/api/files', (req, res, next) => {
-  if (MODE !== 'disk') return res.status(400).json({ error: 'Use /api/blob-upload in blob mode' });
+  if (MODE !== 'disk') return res.status(400).json({ error: 'Use /api/parts in blob mode' });
   upload.array('files')(req, res, (err) => {
     if (err) return next(err);
     if (!req.files || req.files.length === 0) {
@@ -149,50 +169,61 @@ app.post('/api/files', (req, res, next) => {
   });
 });
 
-function assertValidBlobPath(pathname) {
-  if (!pathname.startsWith(BLOB_PREFIX) || !BLOB_ID_RE.test(pathname.slice(BLOB_PREFIX.length))) {
-    throw new Error('Invalid file path');
+// Blob mode: store one part. Query: id=<timestamp>/<size>/<name>, index=<n>.
+app.put(
+  '/api/parts',
+  express.raw({ type: () => true, limit: CHUNK_SIZE + 1024 }),
+  async (req, res, next) => {
+    if (MODE !== 'blob') return res.status(400).json({ error: 'Blob storage is not enabled' });
+    const { id } = req.query;
+    const size = parseFileId(id);
+    const index = Number(req.query.index);
+    if (size === null) return res.status(400).json({ error: 'Invalid file id or file larger than 50 MB' });
+    const parts = partCount(size);
+    if (!Number.isInteger(index) || index < 0 || index >= parts) {
+      return res.status(400).json({ error: 'Invalid part index' });
+    }
+    const body = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+    const expected = index < parts - 1 ? CHUNK_SIZE : size - CHUNK_SIZE * (parts - 1);
+    if (body.length !== expected) {
+      return res.status(400).json({ error: `Part ${index} should be ${expected} bytes, got ${body.length}` });
+    }
+    try {
+      await put(`${BLOB_PREFIX}${id}/${index}`, body, {
+        access: 'public',
+        addRandomSuffix: false,
+        allowOverwrite: true, // lets the browser retry a failed part
+        contentType: 'application/octet-stream',
+        token: BLOB_TOKEN,
+      });
+      res.status(201).json({ id, index });
+    } catch (err) {
+      next(err);
+    }
   }
-}
+);
 
-// Blob mode: the browser uploads straight to Vercel Blob (bypassing Vercel's
-// 4.5 MB request limit); this endpoint only issues short-lived upload permission.
-app.post('/api/blob-upload', express.json(), async (req, res) => {
+// Blob mode: fetch one part. Query: id, index.
+app.get('/api/parts', async (req, res, next) => {
   if (MODE !== 'blob') return res.status(400).json({ error: 'Blob storage is not enabled' });
-  const limits = { maximumSizeInBytes: MAX_FILE_SIZE, addRandomSuffix: false, allowOverwrite: false };
+  const { id } = req.query;
+  const index = Number(req.query.index);
+  if (parseFileId(id) === null || !Number.isInteger(index) || index < 0) {
+    return res.status(400).json({ error: 'Invalid part' });
+  }
   try {
-    const result =
-      BLOB_AUTH === 'oidc'
-        ? await handleUploadPresigned({
-            request: req,
-            body: req.body,
-            getSignedToken: async (pathname) => {
-              assertValidBlobPath(pathname);
-              const token = await issueSignedToken({
-                pathname,
-                operations: ['put'],
-                maximumSizeInBytes: MAX_FILE_SIZE,
-              });
-              return { token, urlOptions: limits };
-            },
-          })
-        : await handleUpload({
-            token: BLOB_TOKEN,
-            request: req,
-            body: req.body,
-            onBeforeGenerateToken: async (pathname) => {
-              assertValidBlobPath(pathname);
-              return limits;
-            },
-          });
-    res.json(result);
+    const result = await get(`${BLOB_PREFIX}${id}/${index}`, { access: 'public', token: BLOB_TOKEN });
+    if (!result || result.statusCode !== 200) return res.status(404).json({ error: 'Part not found' });
+    res.set('Content-Type', 'application/octet-stream');
+    res.set('Cache-Control', 'private, max-age=3600');
+    Readable.fromWeb(result.stream).pipe(res);
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    next(err);
   }
 });
 
 app.get('/api/files/:id', (req, res) => {
-  if (MODE === 'blob') return res.status(400).json({ error: 'Download from the file\'s downloadUrl' });
+  if (MODE === 'blob') return res.status(400).json({ error: 'Download parts from /api/parts' });
   const filePath = resolveStoredFile(req.params.id);
   if (!filePath) return res.status(404).json({ error: 'File not found' });
   res.download(filePath, req.params.id);
@@ -202,8 +233,10 @@ app.delete('/api/files/:id', async (req, res, next) => {
   const { id } = req.params;
   try {
     if (MODE === 'blob') {
-      if (!BLOB_ID_RE.test(id)) return res.status(404).json({ error: 'File not found' });
-      await del(BLOB_PREFIX + id, { token: BLOB_TOKEN });
+      if (parseFileId(id) === null) return res.status(404).json({ error: 'File not found' });
+      const blobs = await listBlobs(`${BLOB_PREFIX}${id}/`);
+      if (!blobs.length) return res.status(404).json({ error: 'File not found' });
+      await del(blobs.map((b) => b.url), { token: BLOB_TOKEN });
     } else {
       const filePath = resolveStoredFile(id);
       if (!filePath) return res.status(404).json({ error: 'File not found' });
@@ -221,6 +254,9 @@ app.use((err, req, res, next) => {
       return res.status(413).json({ error: 'File too large. Maximum size is 50 MB.' });
     }
     return res.status(400).json({ error: err.message });
+  }
+  if (err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'Part too large' });
   }
   console.error(err);
   // Blob SDK messages (e.g. missing credentials) are safe and useful to show.

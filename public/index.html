@@ -79,7 +79,7 @@
   const statusEl = document.getElementById('status');
   const list = document.getElementById('files');
   let mode = 'disk';
-  let blobUpload = 'client-token';
+  let chunkSize = 4 * 1024 * 1024;
   let busy = false;
 
   function fmtSize(b) {
@@ -103,7 +103,7 @@
       return;
     }
     mode = data.mode;
-    blobUpload = data.blobUpload;
+    chunkSize = data.chunkSize || chunkSize;
     list.innerHTML = '';
     if (!data.files.length) {
       list.innerHTML = '<li class="empty">No files uploaded yet.</li>';
@@ -114,13 +114,18 @@
       li.innerHTML = `
         <div class="meta">
           <div class="name"></div>
-          <div class="info">${fmtSize(f.size)} · ${new Date(f.uploadedAt).toLocaleString()}</div>
+          <div class="info">${fmtSize(f.size)} · ${new Date(f.uploadedAt).toLocaleString()}${f.complete ? '' : ' · incomplete upload'}</div>
         </div>
-        <a class="btn" download>Download</a>
+        ${f.complete ? '<a class="btn" download>Download</a>' : ''}
         <button class="del">Delete</button>`;
       li.querySelector('.name').textContent = f.name;
       li.querySelector('.name').title = f.name;
-      li.querySelector('a.btn').href = f.downloadUrl;
+      const dl = li.querySelector('a.btn');
+      if (dl && f.downloadUrl) dl.href = f.downloadUrl;
+      else if (dl) {
+        dl.href = '#';
+        dl.onclick = (e) => { e.preventDefault(); downloadFromParts(f); };
+      }
       li.querySelector('.del').onclick = () => deleteFile(f);
       list.appendChild(li);
     }
@@ -156,26 +161,82 @@
     });
   }
 
-  // Blob mode: the browser sends each file straight to Vercel Blob storage.
+  // Vercel functions accept at most 4.5 MB per request, so blob mode sends
+  // and fetches files as parts of `chunkSize` bytes, retrying each part.
+  async function withRetry(fn, attempts = 3) {
+    for (let i = 1; ; i++) {
+      try { return await fn(); } catch (err) {
+        if (i >= attempts) throw err;
+        await new Promise((r) => setTimeout(r, 1000 * i));
+      }
+    }
+  }
+
   async function uploadToBlob(files) {
-    const blob = await import('/vendor/blob-client.js');
-    // Stores using OIDC auth need presigned uploads; token-based stores use client tokens.
-    const put = blobUpload === 'presigned' ? blob.uploadPresigned : blob.upload;
     const total = files.reduce((n, f) => n + f.size, 0) || 1;
     let done = 0;
     for (const f of files) {
-      const safeName = f.name.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim() || 'file';
-      await put(`uploads/${Date.now()}/${safeName}`, f, {
-        access: 'public',
-        handleUploadUrl: '/api/blob-upload',
-        multipart: f.size > 5 * 1024 * 1024,
-        onUploadProgress: ({ loaded }) => {
-          bar.style.width = `${((done + loaded) / total) * 100}%`;
-        },
-      });
-      done += f.size;
+      const safeName = f.name.replace(/[<>:"/\\|?*#\x00-\x1f]/g, '_').trim() || 'file';
+      const id = `${Date.now()}/${f.size}/${safeName}`;
+      const parts = Math.max(1, Math.ceil(f.size / chunkSize));
+      try {
+        for (let i = 0; i < parts; i++) {
+          const chunk = f.slice(i * chunkSize, (i + 1) * chunkSize);
+          await withRetry(async () => {
+            const res = await fetch(`/api/parts?id=${encodeURIComponent(id)}&index=${i}`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/octet-stream' },
+              body: chunk,
+            });
+            if (!res.ok) {
+              const data = await res.json().catch(() => ({}));
+              throw new Error(data.error || `Upload failed (${res.status})`);
+            }
+          });
+          done += chunk.size;
+          bar.style.width = `${(done / total) * 100}%`;
+          setStatus(`Uploading ${f.name}: part ${i + 1} of ${parts}…`);
+        }
+      } catch (err) {
+        // Don't leave a half-uploaded file behind.
+        fetch(`/api/files/${encodeURIComponent(id)}`, { method: 'DELETE' }).catch(() => {});
+        throw new Error(`${f.name}: ${err.message}`);
+      }
     }
     return files.length;
+  }
+
+  async function downloadFromParts(f) {
+    if (busy) return;
+    busy = true;
+    bar.style.width = '0';
+    progress.style.display = 'block';
+    try {
+      const chunks = [];
+      for (let i = 0; i < f.parts; i++) {
+        setStatus(`Downloading ${f.name}: part ${i + 1} of ${f.parts}…`);
+        chunks.push(await withRetry(async () => {
+          const res = await fetch(`/api/parts?id=${encodeURIComponent(f.id)}&index=${i}`);
+          if (!res.ok) throw new Error(`Download failed (${res.status})`);
+          return res.blob();
+        }));
+        bar.style.width = `${((i + 1) / f.parts) * 100}%`;
+      }
+      const url = URL.createObjectURL(new Blob(chunks));
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = f.name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+      setStatus(`Downloaded ${f.name}`, 'ok');
+    } catch (err) {
+      setStatus(`${f.name}: ${err.message}`, 'err');
+    } finally {
+      busy = false;
+      progress.style.display = 'none';
+    }
   }
 
   async function uploadFiles(fileList) {
