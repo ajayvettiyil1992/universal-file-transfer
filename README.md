@@ -8,7 +8,7 @@ The app chooses where files are stored when it starts:
 
 | Mode   | When                             | Where files go                                                  |
 |--------|----------------------------------|-----------------------------------------------------------------|
-| `blob` | `BLOB_READ_WRITE_TOKEN` is set   | [Vercel Blob](https://vercel.com/docs/vercel-blob). The browser uploads directly to Blob. |
+| `blob` | `BLOB_READ_WRITE_TOKEN` or `BLOB_STORE_ID` is set | [Vercel Blob](https://vercel.com/docs/vercel-blob). The browser uploads directly to Blob. |
 | `disk` | Otherwise (local machine or VPS) | `./uploads`, or the folder set by `UPLOAD_DIR`                  |
 
 Vercel needs Blob mode. Vercel functions have no persistent filesystem and accept request bodies of at most 4.5 MB. To get around the size limit, the browser sends each file straight to Blob storage, and the server only issues a short-lived upload token that caps each file at 50 MB.
@@ -27,6 +27,8 @@ Optional environment variables: `PORT` (default `3000`) and `UPLOAD_DIR` (defaul
 1. Import this GitHub repo in Vercel (**Add New → Project**). The defaults work, and Vercel detects the Express app in `server.js`.
 2. In the project, open **Storage → Create → Blob**, choose **Public** access, and connect the store to the project. Connecting it adds `BLOB_READ_WRITE_TOKEN`.
 3. Redeploy so the new variable is applied.
+
+Newer Blob stores give the project `BLOB_STORE_ID` and `BLOB_WEBHOOK_PUBLIC_KEY` instead of a read-write token, and authenticate with Vercel OIDC. The app detects this and uses presigned uploads. OIDC must be enabled under **Settings → Security → Secure backend access with OIDC federation** (it is on by default for new projects).
 
 If you skip step 2, the page loads but shows "Storage is not configured".
 

@@ -2,8 +2,8 @@ const express = require('express');
 const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
-const { list, del } = require('@vercel/blob');
-const { handleUpload } = require('@vercel/blob/client');
+const { list, del, issueSignedToken, BlobError } = require('@vercel/blob');
+const { handleUpload, handleUploadPresigned } = require('@vercel/blob/client');
 
 const PORT = process.env.PORT || 3000;
 const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || path.join(__dirname, 'uploads'));
@@ -24,9 +24,15 @@ function findBlobToken() {
 }
 const BLOB_TOKEN = findBlobToken();
 
+// Newer Blob stores give the project BLOB_STORE_ID instead of a read-write
+// token and authenticate with the function's Vercel OIDC token.
+// "token": read-write token; browser uploads use client tokens.
+// "oidc": OIDC; browser uploads use presigned URLs.
+const BLOB_AUTH = BLOB_TOKEN ? 'token' : process.env.BLOB_STORE_ID ? 'oidc' : null;
+
 // "blob": Vercel Blob storage (needed on Vercel, whose filesystem is not persistent).
 // "disk": local folder, for running on your own machine or a VPS.
-const MODE = BLOB_TOKEN ? 'blob' : process.env.VERCEL ? 'unconfigured' : 'disk';
+const MODE = BLOB_AUTH ? 'blob' : process.env.VERCEL ? 'unconfigured' : 'disk';
 
 if (MODE === 'disk') fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
@@ -118,7 +124,12 @@ app.get('/api/files', async (req, res, next) => {
         });
     }
     files.sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt));
-    res.json({ mode: MODE, files, maxFileSize: MAX_FILE_SIZE });
+    res.json({
+      mode: MODE,
+      blobUpload: BLOB_AUTH === 'oidc' ? 'presigned' : 'client-token',
+      files,
+      maxFileSize: MAX_FILE_SIZE,
+    });
   } catch (err) {
     next(err);
   }
@@ -138,22 +149,42 @@ app.post('/api/files', (req, res, next) => {
   });
 });
 
+function assertValidBlobPath(pathname) {
+  if (!pathname.startsWith(BLOB_PREFIX) || !BLOB_ID_RE.test(pathname.slice(BLOB_PREFIX.length))) {
+    throw new Error('Invalid file path');
+  }
+}
+
 // Blob mode: the browser uploads straight to Vercel Blob (bypassing Vercel's
-// 4.5 MB request limit); this endpoint only issues a short-lived upload token.
+// 4.5 MB request limit); this endpoint only issues short-lived upload permission.
 app.post('/api/blob-upload', express.json(), async (req, res) => {
   if (MODE !== 'blob') return res.status(400).json({ error: 'Blob storage is not enabled' });
+  const limits = { maximumSizeInBytes: MAX_FILE_SIZE, addRandomSuffix: false, allowOverwrite: false };
   try {
-    const result = await handleUpload({
-      token: BLOB_TOKEN,
-      request: req,
-      body: req.body,
-      onBeforeGenerateToken: async (pathname) => {
-        if (!pathname.startsWith(BLOB_PREFIX) || !BLOB_ID_RE.test(pathname.slice(BLOB_PREFIX.length))) {
-          throw new Error('Invalid file path');
-        }
-        return { maximumSizeInBytes: MAX_FILE_SIZE, addRandomSuffix: false, allowOverwrite: false };
-      },
-    });
+    const result =
+      BLOB_AUTH === 'oidc'
+        ? await handleUploadPresigned({
+            request: req,
+            body: req.body,
+            getSignedToken: async (pathname) => {
+              assertValidBlobPath(pathname);
+              const token = await issueSignedToken({
+                pathname,
+                operations: ['put'],
+                maximumSizeInBytes: MAX_FILE_SIZE,
+              });
+              return { token, urlOptions: limits };
+            },
+          })
+        : await handleUpload({
+            token: BLOB_TOKEN,
+            request: req,
+            body: req.body,
+            onBeforeGenerateToken: async (pathname) => {
+              assertValidBlobPath(pathname);
+              return limits;
+            },
+          });
     res.json(result);
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -192,6 +223,8 @@ app.use((err, req, res, next) => {
     return res.status(400).json({ error: err.message });
   }
   console.error(err);
+  // Blob SDK messages (e.g. missing credentials) are safe and useful to show.
+  if (err instanceof BlobError) return res.status(502).json({ error: `Storage error: ${err.message}` });
   res.status(500).json({ error: 'Internal server error' });
 });
 

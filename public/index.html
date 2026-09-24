@@ -79,6 +79,7 @@
   const statusEl = document.getElementById('status');
   const list = document.getElementById('files');
   let mode = 'disk';
+  let blobUpload = 'client-token';
   let busy = false;
 
   function fmtSize(b) {
@@ -102,6 +103,7 @@
       return;
     }
     mode = data.mode;
+    blobUpload = data.blobUpload;
     list.innerHTML = '';
     if (!data.files.length) {
       list.innerHTML = '<li class="empty">No files uploaded yet.</li>';
@@ -156,12 +158,14 @@
 
   // Blob mode: the browser sends each file straight to Vercel Blob storage.
   async function uploadToBlob(files) {
-    const { upload } = await import('/vendor/blob-client.js');
+    const blob = await import('/vendor/blob-client.js');
+    // Stores using OIDC auth need presigned uploads; token-based stores use client tokens.
+    const put = blobUpload === 'presigned' ? blob.uploadPresigned : blob.upload;
     const total = files.reduce((n, f) => n + f.size, 0) || 1;
     let done = 0;
     for (const f of files) {
       const safeName = f.name.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim() || 'file';
-      await upload(`uploads/${Date.now()}/${safeName}`, f, {
+      await put(`uploads/${Date.now()}/${safeName}`, f, {
         access: 'public',
         handleUploadUrl: '/api/blob-upload',
         multipart: f.size > 5 * 1024 * 1024,
