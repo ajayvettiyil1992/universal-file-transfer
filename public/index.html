@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Universal File Transfer</title>
+  <style>
+    :root {
+      --bg: #f5f6f8; --card: #fff; --text: #1d2330; --muted: #6b7280;
+      --border: #e2e5ea; --accent: #2563eb; --danger: #dc2626; --ok: #16a34a;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #111418; --card: #1a1f26; --text: #e6e8eb; --muted: #9aa3ae;
+        --border: #2b323c; --accent: #4f8cff; --danger: #f05252; --ok: #34d399;
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: var(--bg); color: var(--text); }
+    main { max-width: 820px; margin: 0 auto; padding: 32px 16px; }
+    h1 { font-size: 1.5rem; margin: 0 0 4px; }
+    .sub { color: var(--muted); margin: 0 0 24px; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 20px; }
+    #drop { border: 2px dashed var(--border); border-radius: 10px; padding: 36px 16px; text-align: center;
+      cursor: pointer; transition: border-color .15s, background .15s; }
+    #drop.over { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+    #drop strong { color: var(--accent); }
+    .progress { height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; margin-top: 14px; display: none; }
+    .progress > div { height: 100%; width: 0; background: var(--accent); transition: width .1s; }
+    #status { margin-top: 10px; min-height: 1.2em; font-size: .9rem; }
+    #status.err { color: var(--danger); } #status.ok { color: var(--ok); }
+    .list-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .list-head h2 { font-size: 1.1rem; margin: 0; }
+    ul { list-style: none; margin: 0; padding: 0; }
+    li { display: flex; align-items: center; gap: 12px; padding: 12px 0; border-top: 1px solid var(--border); }
+    .meta { flex: 1; min-width: 0; }
+    .name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .info { color: var(--muted); font-size: .85rem; }
+    button, a.btn { font: inherit; font-size: .875rem; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border);
+      background: transparent; color: var(--text); cursor: pointer; text-decoration: none; white-space: nowrap; }
+    a.btn { border-color: var(--accent); color: var(--accent); }
+    button.del { border-color: var(--danger); color: var(--danger); }
+    button:hover, a.btn:hover { filter: brightness(1.15); }
+    .empty { color: var(--muted); padding: 16px 0; text-align: center; }
+    @media (max-width: 520px) { li { flex-wrap: wrap; } .meta { flex-basis: 100%; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Universal File Transfer</h1>
+  <p class="sub">Upload any file type (ZIP, images, PDFs, videos…) up to 50 MB each.</p>
+
+  <section class="card">
+    <div id="drop" tabindex="0" role="button" aria-label="Choose files to upload">
+      <p><strong>Click to choose files</strong> or drag and drop them here</p>
+      <p class="info">Max 50 MB per file</p>
+      <input id="picker" type="file" multiple hidden />
+    </div>
+    <div class="progress" id="progress"><div></div></div>
+    <div id="status" role="status"></div>
+  </section>
+
+  <section class="card">
+    <div class="list-head">
+      <h2>Stored files</h2>
+      <button id="refresh">Refresh</button>
+    </div>
+    <ul id="files"></ul>
+  </section>
+</main>
+
+<script type="module">
+  const MAX = 50 * 1024 * 1024;
+  const drop = document.getElementById('drop');
+  const picker = document.getElementById('picker');
+  const progress = document.getElementById('progress');
+  const bar = progress.firstElementChild;
+  const statusEl = document.getElementById('status');
+  const list = document.getElementById('files');
+  let mode = 'disk';
+  let busy = false;
+
+  function fmtSize(b) {
+    const u = ['B', 'KB', 'MB', 'GB'];
+    let i = 0;
+    while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+    return `${b.toFixed(i ? 1 : 0)} ${u[i]}`;
+  }
+
+  function setStatus(msg, kind = '') {
+    statusEl.textContent = msg;
+    statusEl.className = kind;
+  }
+
+  async function loadFiles() {
+    const res = await fetch('/api/files');
+    const data = await res.json();
+    if (!res.ok) {
+      setStatus(data.error || 'Could not load files', 'err');
+      list.innerHTML = '';
+      return;
+    }
+    mode = data.mode;
+    list.innerHTML = '';
+    if (!data.files.length) {
+      list.innerHTML = '<li class="empty">No files uploaded yet.</li>';
+      return;
+    }
+    for (const f of data.files) {
+      const li = document.createElement('li');
+      li.innerHTML = `
+        <div class="meta">
+          <div class="name"></div>
+          <div class="info">${fmtSize(f.size)} · ${new Date(f.uploadedAt).toLocaleString()}</div>
+        </div>
+        <a class="btn" download>Download</a>
+        <button class="del">Delete</button>`;
+      li.querySelector('.name').textContent = f.name;
+      li.querySelector('.name').title = f.name;
+      li.querySelector('a.btn').href = f.downloadUrl;
+      li.querySelector('.del').onclick = () => deleteFile(f);
+      list.appendChild(li);
+    }
+  }
+
+  async function deleteFile(f) {
+    if (!confirm(`Delete "${f.name}"? This cannot be undone.`)) return;
+    const res = await fetch(`/api/files/${encodeURIComponent(f.id)}`, { method: 'DELETE' });
+    const data = await res.json();
+    if (res.ok) setStatus(`Deleted ${f.name}`, 'ok');
+    else setStatus(data.error || 'Delete failed', 'err');
+    loadFiles();
+  }
+
+  // Disk mode: one multipart POST to this server.
+  function uploadToServer(files) {
+    return new Promise((resolve, reject) => {
+      const form = new FormData();
+      files.forEach((f) => form.append('files', f));
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/api/files');
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) bar.style.width = `${(e.loaded / e.total) * 100}%`;
+      };
+      xhr.onload = () => {
+        let data = {};
+        try { data = JSON.parse(xhr.responseText); } catch {}
+        if (xhr.status === 201) resolve(data.uploaded.length);
+        else reject(new Error(data.error || `Upload failed (${xhr.status})`));
+      };
+      xhr.onerror = () => reject(new Error('Network error during upload'));
+      xhr.send(form);
+    });
+  }
+
+  // Blob mode: the browser sends each file straight to Vercel Blob storage.
+  async function uploadToBlob(files) {
+    const { upload } = await import('/vendor/blob-client.js');
+    const total = files.reduce((n, f) => n + f.size, 0) || 1;
+    let done = 0;
+    for (const f of files) {
+      const safeName = f.name.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim() || 'file';
+      await upload(`uploads/${Date.now()}/${safeName}`, f, {
+        access: 'public',
+        handleUploadUrl: '/api/blob-upload',
+        multipart: f.size > 5 * 1024 * 1024,
+        onUploadProgress: ({ loaded }) => {
+          bar.style.width = `${((done + loaded) / total) * 100}%`;
+        },
+      });
+      done += f.size;
+    }
+    return files.length;
+  }
+
+  async function uploadFiles(fileList) {
+    const files = [...fileList];
+    picker.value = '';
+    if (!files.length || busy) return;
+    const tooBig = files.filter((f) => f.size > MAX);
+    if (tooBig.length) {
+      setStatus(`Too large (max 50 MB): ${tooBig.map((f) => f.name).join(', ')}`, 'err');
+      return;
+    }
+
+    busy = true;
+    bar.style.width = '0';
+    progress.style.display = 'block';
+    setStatus(`Uploading ${files.length} file(s)…`);
+    try {
+      const n = mode === 'blob' ? await uploadToBlob(files) : await uploadToServer(files);
+      setStatus(`Uploaded ${n} file(s)`, 'ok');
+    } catch (err) {
+      setStatus(err.message || 'Upload failed', 'err');
+    } finally {
+      busy = false;
+      progress.style.display = 'none';
+      loadFiles();
+    }
+  }
+
+  drop.onclick = () => picker.click();
+  drop.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); picker.click(); } };
+  picker.onchange = () => uploadFiles(picker.files);
+  drop.ondragover = (e) => { e.preventDefault(); drop.classList.add('over'); };
+  drop.ondragleave = () => drop.classList.remove('over');
+  drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove('over'); uploadFiles(e.dataTransfer.files); };
+  document.getElementById('refresh').onclick = loadFiles;
+
+  loadFiles();
+</script>
+</body>
+</html>

@@ -1,0 +1,23 @@
+{
+  "name": "universal-file-transfer",
+  "version": "1.0.0",
+  "description": "Upload, store, download and delete files (any type, up to 50 MB) on a Node.js server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "build:client": "esbuild client/blob-client.js --bundle --format=esm --platform=browser --minify --outfile=public/vendor/blob-client.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@vercel/blob": "^2.8.0",
+    "express": "^5.2.1",
+    "multer": "^2.4.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}
